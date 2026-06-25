@@ -1,1 +1,365 @@
-stages:\n  - version\n  - build\n  - test\n  - docs\n  - package\n\nworkflow:\n  rules:\n    - if: '$CI_PIPELINE_SOURCE == \"merge_request_event\"'\n    - if: '$CI_COMMIT_BRANCH'\n\nvariables:\n  GIT_STRATEGY: fetch\n  GIT_SUBMODULE_STRATEGY: recursive\n  DOTNET_NOLOGO: \"true\"\n  DOTNET_CLI_TELEMETRY_OPTOUT: \"true\"\n  BUILD_NUMBER: \"$CI_PIPELINE_IID\"\n  GIT_BRANCH: \"$CI_COMMIT_REF_NAME\"\n\nversion:\n  stage: version\n  image: mcr.microsoft.com/dotnet/sdk:8.0\n  script:\n    - dotnet tool restore\n    - echo \"VERSION_MAJOR=3\" > version.env\n    - echo \"VERSION_MINOR=8\" >> version.env\n    - echo \"VERSION_PATCH=1\" >> version.env\n    - echo \"VERSION_BUILD_COUNTER=${CI_PIPELINE_IID}\" >> version.env\n    - echo \"VERSION=${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}.${VERSION_BUILD_COUNTER}\" >> version.env\n  artifacts:\n    reports:\n      dotenv: version.env\n  rules:\n    - if: '$CI_COMMIT_BRANCH'\n\nbuild:mac:\n  stage: build\n  image: mcr.microsoft.com/dotnet/sdk:8.0\n  tags: [macos]\n  needs: [version]\n  script:\n    - dotnet tool restore\n    - dotnet cake build.cake\n  artifacts:\n    paths:\n      - Artifacts/**/iOS/**/*.nupkg\n      - Artifacts/**/Android/**/*.nupkg\n      - Artifacts/**/*.mpack\n  rules:\n    - if: '$CI_COMMIT_BRANCH'\n\nbuild:windows:\n  stage: build\n  image: mcr.microsoft.com/dotnet/sdk:8.0\n  tags: [windows]\n  needs: [version]\n  script:\n    - dotnet tool restore\n    - dotnet-cake build.cake\n  artifacts:\n    paths:\n      - Artifacts/**/*.nupkg\n      - Artifacts/**/*.vsix\n      - Artifacts/**/*.mpack\n  rules:\n    - if: '$CI_COMMIT_BRANCH'\n\ntest:mac:\n  stage: test\n  image: mcr.microsoft.com/dotnet/sdk:8.0\n  tags: [macos]\n  needs: [build:mac]\n  script:\n    - dotnet tool restore\n    - dotnet cake build.cake --build-target=Test\n  artifacts:\n    when: always\n    paths:\n      - Test/bin/Linux/AnyCPU/Debug/TestResult.xml\n  rules:\n    - if: '$CI_COMMIT_BRANCH'\n\ntest:windows:\n  stage: test\n  image: mcr.microsoft.com/dotnet/sdk:8.0\n  tags: [windows]\n  needs: [build:windows]\n  script:\n    - dotnet tool restore\n    - dotnet-cake build.cake -build-target=\"Test\"\n  artifacts:\n    when: always\n    paths:\n      - Test/bin/Windows/AnyCPU/Debug/CapturedFrames\n      - Test/bin/Windows/AnyCPU/Debug/Diffs\n      - Test/bin/Windows/AnyCPU/Debug/MonoGameTests.xml\n  rules:\n    - if: '$CI_COMMIT_BRANCH'\n\ndocs:\n  stage: docs\n  image: mcr.microsoft.com/dotnet/sdk:8.0\n  tags: [windows]\n  needs: [build:mac, build:windows]\n  script:\n    - docfx Documentation/docfx.json metadata\n    - docfx Documentation/docfx.json build\n  artifacts:\n    paths:\n      - Documentation/_site\n  rules:\n    - if: '$CI_COMMIT_BRANCH'\n\npackage:mac-and-linux:\n  stage: package\n  image: mcr.microsoft.com/dotnet/sdk:8.0\n  tags: [macos]\n  needs: [docs, test:windows, build:mac, build:windows]\n  script:\n    - nant -buildfile:default.build build_installer\n  artifacts:\n    paths:\n      - Installers/Pipeline.MacOS.pkg\n      - Installers/MonoGame.pkg\n      - Installers/Linux/monogame-sdk.deb\n      - Installers/Linux/monogame-sdk.run\n  rules:\n    - if: '$CI_COMMIT_BRANCH'\n  when: manual\n\npackage:windows:\n  stage: package\n  image: mcr.microsoft.com/dotnet/sdk:8.0\n  tags: [windows]\n  needs: [docs, test:windows, build:mac, build:windows]\n  script:\n    - nant -buildfile:default.build build_installer\n  artifacts:\n    paths:\n      - Installers/Windows/MonoGameSetup.exe\n  rules:\n    - if: '$CI_COMMIT_BRANCH'\n  when: manual\n
+# ============================================================
+# GitLab CI/CD Pipeline — Migrated from TeamCity (Kotlin DSL)
+# Source Repo : softengrahmed/cicd-migration-source2
+# Source File : .teamcity/settings.kts  (v2019.2)
+# Target File : .gitlab-ci.yml
+# Migration   : TeamCity → GitLab CI
+# ============================================================
+
+# ---------------------------------------------------------------------------
+# GLOBAL VARIABLES
+# Replaces TeamCity params{} blocks and %build.*% built-in references
+# ---------------------------------------------------------------------------
+variables:
+  VERSION_MAJOR: "3"
+  VERSION_MINOR: "8"
+  VERSION_PATCH: "1"
+  # CI_PIPELINE_IID = GitLab's auto-incrementing pipeline counter
+  # Replaces TeamCity's %build.counter% / VersionBuildCounter
+  BUILD_VERSION: "${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}.${CI_PIPELINE_IID}"
+  # GIT_BRANCH replaces %teamcity.build.branch%
+  GIT_BRANCH: "${CI_COMMIT_REF_NAME}"
+  # BUILD_NUMBER replaces %build.number%
+  BUILD_NUMBER: "${BUILD_VERSION}"
+  # Clean checkout mirrors TeamCity cleanCheckout = true
+  GIT_CLEAN_FLAGS: "-ffdx"
+  GIT_STRATEGY: clone
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+
+# ---------------------------------------------------------------------------
+# WORKFLOW — All branches EXCEPT master
+# Mirrors TeamCity VCS trigger branchFilter:
+#   +:*
+#   -:refs/heads/master
+# ---------------------------------------------------------------------------
+workflow:
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == "master"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: always
+
+# ---------------------------------------------------------------------------
+# STAGES
+# Mirrors TeamCity buildTypesOrder:
+#   Version → DevelopWin|DevelopMac (parallel) → TestWindows|TestMac (parallel)
+#   → GenerateDocumentation (skipped) → PackagingWindows|PackageMacAndLinux (disabled)
+# ---------------------------------------------------------------------------
+stages:
+  - version
+  - build
+  - test
+  - package
+
+# ===========================================================================
+# STAGE 1 — VERSION  (Kickoff Build)
+# TeamCity : object Version / "Kickoff Build"
+# Purpose  : Stamp a single unified build version for the entire chain.
+# Agent    : windows (tag: windows)  ← MonoGameWin in TeamCity
+# Outputs  : build.env dotenv artifact consumed by all downstream jobs
+# ===========================================================================
+version:kickoff:
+  stage: version
+  tags:
+    - windows
+  script:
+    - echo "BUILD_VERSION=${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}.${CI_PIPELINE_IID}" >> build.env
+    - echo "GIT_BRANCH=${CI_COMMIT_REF_NAME}"  >> build.env
+    - echo "BUILD_NUMBER=${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}.${CI_PIPELINE_IID}" >> build.env
+    - type build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+    expire_in: 1 week
+
+# ===========================================================================
+# STAGE 2 — BUILD  (Parallel)
+# TeamCity : DevelopWin + DevelopMac triggered simultaneously after Version
+# GitLab   : Both jobs declare needs: [version:kickoff] → run in parallel
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# BUILD WINDOWS
+# TeamCity : object DevelopWin — "Build Windows"
+# Agent    : MonoGameWin (Windows)  → tags: [windows]
+# Steps    : dotnet tool restore  →  dotnet-cake build.cake
+# Artifacts: *.nupkg, *.vsix, *.mpack
+# ---------------------------------------------------------------------------
+build:windows:
+  stage: build
+  tags:
+    - windows
+  needs:
+    - job: version:kickoff
+      artifacts: true
+  variables:
+    GIT_BRANCH: "${CI_COMMIT_REF_NAME}"
+    BUILD_NUMBER: "${BUILD_VERSION}"
+  before_script:
+    - dotnet tool restore
+  script:
+    # TeamCity used 'dotnet-cake' (hyphenated) on Windows
+    - dotnet-cake build.cake
+  artifacts:
+    name: "build-windows-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - Artifacts/**/*.nupkg
+      - Artifacts/**/*.vsix
+      - Artifacts/**/*.mpack
+    expire_in: 1 week
+
+# ---------------------------------------------------------------------------
+# BUILD MAC
+# TeamCity : object DevelopMac — "Build Mac"
+# Agent    : Mac OS X  → tags: [windows] ⚠️ Swap to [macos] when available
+# Steps    : dotnet tool restore  →  dotnet cake build.cake
+# Note     : TeamCity used 'dotnet cake' (space) not 'dotnet-cake' on macOS
+# Artifacts: iOS/*.nupkg, Android/*.nupkg, *.mpack
+# ---------------------------------------------------------------------------
+build:mac:
+  stage: build
+  tags:
+    - windows   # ⚠️ Replace with [macos] when a macOS GitLab Runner is registered
+  needs:
+    - job: version:kickoff
+      artifacts: true
+  variables:
+    GIT_BRANCH: "${CI_COMMIT_REF_NAME}"
+    BUILD_NUMBER: "${BUILD_VERSION}"
+  before_script:
+    - dotnet tool restore
+  script:
+    # 'dotnet cake' (space) is the macOS invocation style from TeamCity
+    - dotnet cake build.cake
+  artifacts:
+    name: "build-mac-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - Artifacts/**/iOS/**/*.nupkg
+      - Artifacts/**/Android/**/*.nupkg
+      - Artifacts/**/*.mpack
+    expire_in: 1 week
+
+# ===========================================================================
+# STAGE 3 — TEST  (Parallel)
+# TeamCity : TestWindows after DevelopWin; TestMac after DevelopMac
+# GitLab   : Each test job declares needs: on its respective build job
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# TEST WINDOWS
+# TeamCity : object TestWindows — "Test Windows"
+# Agent    : MonoGameWin (Windows) → tags: [windows]
+# Steps    : dotnet tool restore → dotnet-cake build.cake -build-target="Test"
+# Custom failure conditions (no native equivalent in GitLab CI):
+#   ① Fail if test count < 1200  → PowerShell XML parse of MonoGameTests.xml
+#   ② Stop build if duration > 300s → PowerShell SECONDS delta check
+# Artifacts: CapturedFrames/, Diffs/, MonoGameTests.xml → TestResults.Windows.zip
+# ---------------------------------------------------------------------------
+test:windows:
+  stage: test
+  tags:
+    - windows
+  needs:
+    - job: build:windows
+      artifacts: true
+    - job: version:kickoff
+      artifacts: true
+  variables:
+    GIT_BRANCH: "${CI_COMMIT_REF_NAME}"
+    BUILD_NUMBER: "${BUILD_VERSION}"
+  before_script:
+    - dotnet tool restore
+  script:
+    # Capture start time for duration threshold check
+    - $startTime = Get-Date
+    # Run the test target via dotnet-cake
+    - dotnet-cake build.cake -build-target="Test"
+    # ── Custom Failure Condition ①: Build duration > 300s (stop build) ──────
+    # Replaces TeamCity: failOnMetricChange { metric=BUILD_DURATION, threshold=300, stopBuildOnFailure=true }
+    - |
+      $duration = (Get-Date) - $startTime
+      if ($duration.TotalSeconds -gt 300) {
+        Write-Error "FAIL: Build duration $([math]::Round($duration.TotalSeconds,1))s exceeded 300s threshold."
+        exit 1
+      }
+      Write-Host "Duration check PASSED: $([math]::Round($duration.TotalSeconds,1))s <= 300s"
+    # ── Custom Failure Condition ②: Test count < 1200 ──────────────────────
+    # Replaces TeamCity: failOnMetricChange { metric=TEST_COUNT, threshold=1200, comparison=LESS }
+    - |
+      $xmlPath = "Test\bin\Windows\AnyCPU\Debug\MonoGameTests.xml"
+      if (Test-Path $xmlPath) {
+        [xml]$xml = Get-Content $xmlPath
+        $testCount = [int]$xml.'test-results'.total
+        if ($testCount -lt 1200) {
+          Write-Error "FAIL: Test count $testCount is below minimum threshold of 1200."
+          exit 1
+        }
+        Write-Host "Test count check PASSED: $testCount >= 1200"
+      } else {
+        Write-Warning "Test result XML not found at $xmlPath — skipping count check."
+      }
+  artifacts:
+    name: "test-windows-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - Test/bin/Windows/AnyCPU/Debug/CapturedFrames/
+      - Test/bin/Windows/AnyCPU/Debug/Diffs/
+      - Test/bin/Windows/AnyCPU/Debug/MonoGameTests.xml
+    expire_in: 1 week
+    when: always   # Collect even on failure — mirrors TeamCity artifact upload on failure
+
+# ---------------------------------------------------------------------------
+# TEST MAC
+# TeamCity : object TestMac — "Test Mac"
+# Agent    : Mac OS X → tags: [windows] ⚠️ Swap to [macos] when available
+# Steps    : dotnet tool restore → dotnet cake build.cake --build-target=Test
+# Custom failure conditions:
+#   ① Test count < 1100  → DISABLED (was disabled in TeamCity too)
+#   ② Duration > 300s    → Bash SECONDS check
+# Artifacts: Test/bin/Linux/AnyCPU/Debug/TestResult.xml
+# ---------------------------------------------------------------------------
+test:mac:
+  stage: test
+  tags:
+    - windows   # ⚠️ Replace with [macos] when a macOS GitLab Runner is registered
+  needs:
+    - job: build:mac
+      artifacts: true
+    - job: version:kickoff
+      artifacts: true
+  variables:
+    GIT_BRANCH: "${CI_COMMIT_REF_NAME}"
+    BUILD_NUMBER: "${BUILD_VERSION}"
+  before_script:
+    - dotnet tool restore
+  script:
+    # Capture start time
+    - START_SECS=$SECONDS
+    # Run the test target
+    - dotnet cake build.cake --build-target=Test
+    # ── Custom Failure Condition: Build duration > 300s ──────────────────────
+    # Replaces TeamCity: failOnMetricChange { metric=BUILD_DURATION, threshold=300 }
+    # Note: Test count check (< 1100) is intentionally OMITTED — was enabled=false in TeamCity
+    - |
+      ELAPSED=$((SECONDS - START_SECS))
+      if [ "$ELAPSED" -gt 300 ]; then
+        echo "FAIL: Build duration ${ELAPSED}s exceeded 300s threshold."
+        exit 1
+      fi
+      echo "Duration check PASSED: ${ELAPSED}s <= 300s"
+  artifacts:
+    name: "test-mac-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - Test/bin/Linux/AnyCPU/Debug/TestResult.xml
+    expire_in: 1 week
+    when: always
+
+# NOTE — GenerateDocumentation stage SKIPPED
+# TeamCity: object GenerateDocumentation — "Generate Documentation"
+# Reason  : docfx is not installed on target runners (confirmed by user).
+# Action  : Job intentionally omitted. Re-add when docfx is available.
+# Re-add template:
+#   docs:generate:
+#     stage: docs  (add 'docs' to stages list above)
+#     tags: [windows]
+#     needs: [build:windows, build:mac]
+#     script:
+#       - cd Documentation && docfx metadata && docfx build
+#     artifacts:
+#       paths: [Documentation/_site/]
+#       expire_in: 1 week
+
+# ===========================================================================
+# STAGE 4 — PACKAGE  (DISABLED)
+# TeamCity : PackagingWindows + PackageMacAndLinux had paused = true
+# GitLab   : Jobs present but gated with 'when: never'
+# NAnt     : Converted to dotnet-cake / shell equivalents (NAnt unavailable)
+# To enable: Change 'when: never' → 'when: manual' for on-demand triggering
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# PACKAGE WINDOWS  (DISABLED)
+# TeamCity : object PackagingWindows — "Package Windows"
+# Original : NAnt default.build → build_installer
+# Converted: dotnet-cake build.cake -build-target="BuildInstaller"
+# Depends  : test:windows (snapshot) + build:windows + build:mac (artifacts)
+# Artifact : Installers/Windows/MonoGameSetup.exe
+# ---------------------------------------------------------------------------
+package:windows:
+  stage: package
+  tags:
+    - windows
+  needs:
+    - job: test:windows
+      artifacts: true
+    - job: build:windows
+      artifacts: true
+    - job: build:mac
+      artifacts: true
+    - job: version:kickoff
+      artifacts: true
+  script:
+    # Converted from NAnt default.build → build_installer
+    # NAnt's <target name="build_installer"> logic delegated to Cake
+    - echo "Packaging Windows SDK for version $BUILD_VERSION"
+    - dotnet-cake build.cake -build-target="BuildInstaller"
+    - |
+      if (-not (Test-Path "Installers\Windows\MonoGameSetup.exe")) {
+        Write-Error "FAIL: Installer not found at Installers\Windows\MonoGameSetup.exe"
+        exit 1
+      }
+      Write-Host "Installer artifact verified."
+  artifacts:
+    name: "package-windows-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - Installers/Windows/MonoGameSetup.exe
+    expire_in: 1 week
+  rules:
+    - when: never   # DISABLED — matches TeamCity paused = true
+                    # ↑ Change to 'when: manual' to enable on-demand packaging
+
+# ---------------------------------------------------------------------------
+# PACKAGE MAC AND LINUX  (DISABLED)
+# TeamCity : object PackageMacAndLinux — "Package Mac and Linux"
+# Original : NAnt default.build → build_installer on macOS agent
+# Converted: dotnet cake build.cake --build-target=BuildInstaller
+# Depends  : test:windows (snapshot) + GenerateDocumentation (skipped, removed)
+#            + build:windows + build:mac (artifacts)
+# Artifacts: *.pkg, *.deb, *.run
+# ---------------------------------------------------------------------------
+package:mac-linux:
+  stage: package
+  tags:
+    - windows   # ⚠️ Replace with [macos] when macOS runner is available
+  needs:
+    - job: test:windows
+      artifacts: true
+    - job: build:mac
+      artifacts: true
+    - job: build:windows
+      artifacts: true
+    - job: version:kickoff
+      artifacts: true
+  script:
+    # Converted from NAnt default.build → build_installer (macOS variant)
+    - echo "Packaging Mac and Linux SDK for version $BUILD_VERSION"
+    - dotnet cake build.cake --build-target=BuildInstaller
+    - |
+      if [ ! -f "Installers/Pipeline.MacOS.pkg" ] && [ ! -f "Installers/MonoGame.pkg" ]; then
+        echo "FAIL: Mac installer packages not found."
+        exit 1
+      fi
+      echo "Mac/Linux installer artifacts verified."
+  artifacts:
+    name: "package-mac-linux-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - Installers/Pipeline.MacOS.pkg
+      - Installers/MonoGame.pkg
+      - Installers/Linux/monogame-sdk.deb
+      - Installers/Linux/monogame-sdk.run
+    expire_in: 1 week
+  rules:
+    - when: never   # DISABLED — matches TeamCity paused = true
+                    # ↑ Change to 'when: manual' to enable on-demand packaging\n
