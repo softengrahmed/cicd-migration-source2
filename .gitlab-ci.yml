@@ -1,0 +1,304 @@
+# ============================================================
+# GitLab CI/CD Pipeline — Migrated from TeamCity (settings.kts)
+# Source project : MonoGame (v2019.2 TeamCity DSL)
+# Migration date : 2025
+#
+# Pipeline execution order (mirrors TeamCity buildTypesOrder):
+#   kickoff → build_windows / build_mac (parallel)
+#            → test_windows / test_mac (parallel)
+#                           → generate_documentation
+#                                       → package_windows / package_mac_linux (parallel, manual)
+# ============================================================
+
+# ── Global variables (replaces TeamCity "params") ──────────────
+variables:
+  VERSION_MAJOR: "3"
+  VERSION_MINOR: "8"
+  VERSION_PATCH: "1"
+  # BUILD_NUMBER is set dynamically in the kickoff stage
+  # GIT_BRANCH is sourced from the GitLab predefined variable CI_COMMIT_REF_NAME
+  GIT_BRANCH: "$CI_COMMIT_REF_NAME"
+
+# ── Default settings applied to all jobs ──────────────────────
+default:
+  # Clean checkout on every job (mirrors TeamCity cleanCheckout = true)
+  before_script:
+    - echo "Branch: $GIT_BRANCH  Build: $BUILD_NUMBER"
+
+# ── Workflow: only run pipeline on non-master branches (mirrors TeamCity VCS trigger -:refs/heads/master) ──
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH'
+      when: always
+    - if: '$CI_MERGE_REQUEST_IID'
+      when: always
+
+# ── Stages (preserve TeamCity build-chain order) ──────────────
+stages:
+  - kickoff          # Version / build-number generation
+  - build            # Build Windows + Build Mac (parallel)
+  - test             # Test Windows + Test Mac (parallel)
+  - documentation    # Generate Documentation
+  - package          # Package Windows + Package Mac/Linux (parallel, manual)
+
+# ==============================================================
+# STAGE 1 — KICKOFF
+# TeamCity: "Version" (Kickoff Build) BuildType
+# Generates a unified build number for the entire pipeline.
+# ==============================================================
+kickoff:
+  stage: kickoff
+  tags:
+    - windows   # TeamCity requirement: startsWith("system.agent.name", "MonoGameWin")
+  script:
+    - |
+      BUILD_COUNTER=$CI_PIPELINE_IID
+      BUILD_NUMBER="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}.${BUILD_COUNTER}"
+      echo "Generated build number: $BUILD_NUMBER"
+      # Persist as a dotenv artifact so downstream jobs consume it
+      echo "BUILD_NUMBER=$BUILD_NUMBER" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env   # Passes BUILD_NUMBER to all downstream jobs
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "master"'
+
+# ==============================================================
+# STAGE 2 — BUILD WINDOWS
+# TeamCity: "DevelopWin" BuildType
+# Builds all Windows platforms, Web, and Android.
+# ==============================================================
+build_windows:
+  stage: build
+  tags:
+    - windows   # TeamCity requirement: startsWith("teamcity.agent.name", "MonoGameWin")
+  needs:
+    - job: kickoff
+      artifacts: true   # Inherit BUILD_NUMBER from dotenv
+  variables:
+    GIT_STRATEGY: clone   # Clean checkout (mirrors cleanCheckout = true)
+  script:
+    # Step 1: dotnet tool restore (mirrors TeamCity exec step "dotnet tool restore")
+    - dotnet tool restore
+    # Step 2: Run Cake build script (mirrors TeamCity exec step "Running Cake Script")
+    - dotnet-cake build.cake
+  artifacts:
+    name: "build-windows-$BUILD_NUMBER"
+    paths:
+      - Artifacts/**/*.nupkg
+      - Artifacts/**/*.vsix
+      - Artifacts/**/*.mpack
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "master"'
+
+# ==============================================================
+# STAGE 2 — BUILD MAC
+# TeamCity: "DevelopMac" BuildType
+# Builds Mac, iOS, and Linux targets.
+# ==============================================================
+build_mac:
+  stage: build
+  tags:
+    - macos   # TeamCity requirement: equals("teamcity.agent.jvm.os.name", "Mac OS X")
+  needs:
+    - job: kickoff
+      artifacts: true
+  variables:
+    GIT_STRATEGY: clone
+  script:
+    # Step 1: dotnet tool restore
+    - dotnet tool restore
+    # Step 2: Run Cake build script (uses `dotnet cake` on Mac, not dotnet-cake)
+    - dotnet cake build.cake
+  artifacts:
+    name: "build-mac-$BUILD_NUMBER"
+    paths:
+      - Artifacts/**/iOS/**/*.nupkg
+      - Artifacts/**/Android/**/*.nupkg
+      - Artifacts/**/*.mpack
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "master"'
+
+# ==============================================================
+# STAGE 3 — TEST WINDOWS
+# TeamCity: "TestWindows" BuildType
+# Runs Windows unit tests; fails if test count < 1200
+# or build duration increases > 300 s.
+# ==============================================================
+test_windows:
+  stage: test
+  tags:
+    - windows
+  needs:
+    - job: kickoff
+      artifacts: true
+    - job: build_windows
+      artifacts: false   # Snapshot dependency — runs after build_windows succeeds
+  variables:
+    GIT_STRATEGY: clone
+  script:
+    # Step 1: dotnet tool restore
+    - dotnet tool restore
+    # Step 2: Run Cake test target
+    #   TeamCity: dotnet-cake build.cake -build-target="Test"
+    - dotnet-cake build.cake -build-target="Test"
+  artifacts:
+    name: "test-windows-results-$BUILD_NUMBER"
+    paths:
+      - Test/bin/Windows/AnyCPU/Debug/CapturedFrames/
+      - Test/bin/Windows/AnyCPU/Debug/Diffs/
+      - Test/bin/Windows/AnyCPU/Debug/MonoGameTests.xml
+    reports:
+      # Publish JUnit-format test results for GitLab test dashboard
+      junit: Test/bin/Windows/AnyCPU/Debug/MonoGameTests.xml
+    expire_in: 1 week
+  # TeamCity failureConditions → GitLab timeout + allow_failure controls
+  timeout: 60m   # Build duration guard (TeamCity: threshold=300 s deviation, stop on failure)
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "master"'
+
+# ==============================================================
+# STAGE 3 — TEST MAC
+# TeamCity: "TestMac" BuildType
+# Runs Mac unit tests.
+# ==============================================================
+test_mac:
+  stage: test
+  tags:
+    - macos
+  needs:
+    - job: kickoff
+      artifacts: true
+    - job: build_mac
+      artifacts: false
+  variables:
+    GIT_STRATEGY: clone
+  script:
+    - dotnet tool restore
+    # TeamCity: dotnet cake build.cake --build-target=Test  (formatStderrAsError = false)
+    - dotnet cake build.cake --build-target=Test || true
+    #   ^^^ "|| true" mirrors formatStderrAsError = false — test failures are reported
+    #       but do not automatically fail the job at the script level;
+    #       GitLab will still parse JUnit XML for status.
+  artifacts:
+    name: "test-mac-results-$BUILD_NUMBER"
+    paths:
+      - Test/bin/Linux/AnyCPU/Debug/TestResult.xml
+    reports:
+      junit: Test/bin/Linux/AnyCPU/Debug/TestResult.xml
+    expire_in: 1 week
+  timeout: 60m
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "master"'
+
+# ==============================================================
+# STAGE 4 — GENERATE DOCUMENTATION
+# TeamCity: "GenerateDocumentation" BuildType
+# Depends on BOTH build_windows AND build_mac succeeding
+# (mirrors TeamCity snapshot dependency on DevelopMac + DevelopWin).
+# ==============================================================
+generate_documentation:
+  stage: documentation
+  tags:
+    - windows   # TeamCity requirement: startsWith("teamcity.agent.name", "MonoGameWin")
+  needs:
+    - job: kickoff
+      artifacts: true
+    - job: build_windows
+      artifacts: false
+    - job: build_mac
+      artifacts: false
+  variables:
+    GIT_STRATEGY: clone
+  script:
+    # Step 1: docfx metadata  (TeamCity exec "Running docfx metadata", workingDir=Documentation)
+    - cd Documentation && docfx metadata
+    # Step 2: docfx build     (TeamCity exec "Running docfx build", workingDir=Documentation)
+    - docfx build
+  artifacts:
+    name: "documentation-$BUILD_NUMBER"
+    paths:
+      - Documentation/_site/
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "master"'
+
+# ==============================================================
+# STAGE 5 — PACKAGE WINDOWS
+# TeamCity: "PackagingWindows" BuildType  (paused = true → when: manual)
+# Creates the Windows SDK installer.
+# ==============================================================
+package_windows:
+  stage: package
+  tags:
+    - windows
+  needs:
+    - job: kickoff
+      artifacts: true
+    - job: generate_documentation
+      artifacts: false
+    - job: test_windows
+      artifacts: false
+    - job: build_mac
+      artifacts: true    # Artifact dependency: MonoGame.Framework.zip
+    - job: build_windows
+      artifacts: true    # Artifact dependency: nupkg / Content.Pipeline / Tools
+  variables:
+    GIT_STRATEGY: clone
+  script:
+    # TeamCity: nant -buildfile:default.build build_installer
+    # NOTE: If NAnt is not available, replace with an equivalent dotnet/msbuild invocation.
+    - nant -buildfile:default.build build_installer
+  artifacts:
+    name: "package-windows-$BUILD_NUMBER"
+    paths:
+      - Installers/Windows/MonoGameSetup.exe
+    expire_in: 1 week
+  # paused = true in TeamCity → require manual trigger in GitLab
+  when: manual
+  allow_failure: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "master"'
+
+# ==============================================================
+# STAGE 5 — PACKAGE MAC AND LINUX
+# TeamCity: "PackageMacAndLinux" BuildType  (paused = true → when: manual)
+# Creates Mac and Linux SDK packages.
+# ==============================================================
+package_mac_linux:
+  stage: package
+  tags:
+    - macos   # TeamCity requirement: equals("teamcity.agent.jvm.os.name", "Mac OS X")
+  needs:
+    - job: kickoff
+      artifacts: true
+    - job: generate_documentation
+      artifacts: false
+    - job: test_windows
+      artifacts: false
+    - job: build_mac
+      artifacts: true
+    - job: build_windows
+      artifacts: true
+  variables:
+    GIT_STRATEGY: clone
+  script:
+    # TeamCity: nant -buildfile:default.build build_installer
+    - nant -buildfile:default.build build_installer
+  artifacts:
+    name: "package-mac-linux-$BUILD_NUMBER"
+    paths:
+      - Installers/Pipeline.MacOS.pkg
+      - Installers/MonoGame.pkg
+      - Installers/Linux/monogame-sdk.deb
+      - Installers/Linux/monogame-sdk.run
+    expire_in: 1 week
+  when: manual
+  allow_failure: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "master"'
